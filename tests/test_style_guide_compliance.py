@@ -77,6 +77,13 @@ class StyleGuideValidator:
         "gitops_team_yaml_path": "%FLEET_GITOPS_TEAM_YAML_PATH%",
     }
 
+    OPTIONAL_GITOPS_PROCESS_ARGS = {
+        "gitops_storage_provider": "%GITOPS_STORAGE_PROVIDER%",
+        "gcp_storage_bucket": "%GCP_STORAGE_BUCKET%",
+        "gcp_credentials_json": "%GCP_CREDENTIALS_JSON%",
+        "gcp_signed_url_expiration": "%GCP_SIGNED_URL_EXPIRATION%",
+    }
+
     def __init__(self):
         self.errors = []
         self.warnings = []
@@ -587,6 +594,22 @@ class StyleGuideValidator:
                     )
                 else:
                     print(f"   ✅ Process {arg_name}: '{expected_macro}'")
+
+            for arg_name, expected_macro in self.OPTIONAL_GITOPS_PROCESS_ARGS.items():
+                arg_value = args.get(arg_name)
+                if arg_value is None:
+                    continue
+                if arg_value != expected_macro:
+                    self.errors.append(
+                        f"{recipe_path}: Optional process argument '{arg_name}' must be "
+                        f"'{expected_macro}' when present, got '{arg_value}'"
+                    )
+                    print(
+                        f"   ❌ Optional process {arg_name}: '{arg_value}' "
+                        f"(must be '{expected_macro}')"
+                    )
+                else:
+                    print(f"   ✅ Optional process {arg_name}: '{expected_macro}'")
 
     def report_results(self):
         """Print final validation report and return exit code."""

@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import timedelta
 from pathlib import Path
 
 import certifi
@@ -38,6 +39,8 @@ NoCredentialsError = None
 
 # Constants for improved readability
 DEFAULT_PLATFORM = "darwin"
+DEFAULT_GITOPS_STORAGE_PROVIDER = "s3"
+GCS_SIGNED_URL_MAX_EXPIRATION = 604800
 
 # Fleet version constants
 FLEET_MINIMUM_VERSION = "4.74.0"
@@ -146,6 +149,11 @@ class FleetImporter(Processor):
             "default": 0,
             "description": "Number of old versions to retain per software title in S3. Set to 0 to disable pruning (default: 0).",
         },
+        "gitops_storage_provider": {
+            "required": False,
+            "default": DEFAULT_GITOPS_STORAGE_PROVIDER,
+            "description": "Package storage provider for GitOps mode (s3|gcs). Default: s3.",
+        },
         # --- AWS Configuration (required for GitOps mode) ---
         "aws_access_key_id": {
             "required": False,
@@ -159,6 +167,20 @@ class FleetImporter(Processor):
             "required": False,
             "default": "us-east-1",
             "description": "AWS region for S3 operations (default: us-east-1).",
+        },
+        # --- Google Cloud Storage Configuration (required for GitOps GCS mode) ---
+        "gcp_storage_bucket": {
+            "required": False,
+            "description": "Google Cloud Storage bucket name for package storage (required when gitops_storage_provider is gcs).",
+        },
+        "gcp_credentials_json": {
+            "required": False,
+            "description": "Optional Google service account JSON key content or path. If omitted, Application Default Credentials are used.",
+        },
+        "gcp_signed_url_expiration": {
+            "required": False,
+            "default": GCS_SIGNED_URL_MAX_EXPIRATION,
+            "description": "GCS V4 signed URL expiration in seconds. Maximum: 604800 (7 days).",
         },
         # --- Fleet deployment options ---
         "self_service": {
@@ -242,6 +264,9 @@ class FleetImporter(Processor):
         },
         "cloudfront_url": {
             "description": "CloudFront URL for the uploaded package (GitOps mode only)."
+        },
+        "gcs_signed_url": {
+            "description": "Google Cloud Storage signed URL for the uploaded package (GitOps GCS mode only)."
         },
         "pull_request_url": {
             "description": "URL of the created pull request (GitOps mode only)."
@@ -899,21 +924,7 @@ class FleetImporter(Processor):
             )
 
     def _run_gitops_workflow(self):
-        """Run the GitOps workflow: upload to S3, update YAML, create PR."""
-        # Import boto3 for GitOps mode (required for S3 operations)
-        global boto3, ClientError, NoCredentialsError
-        try:
-            import boto3
-            from botocore.exceptions import ClientError, NoCredentialsError
-        except ImportError:
-            raise ProcessorError(
-                "boto3 is required for GitOps mode.\n\n"
-                "Install it into AutoPkg's Python environment with:\n"
-                "  /Library/AutoPkg/Python3/Python.framework/Versions/Current/bin/python3 -m pip install boto3>=1.18.0\n\n"
-                "Or use direct mode to upload directly to Fleet API without S3/GitOps:\n"
-                "  Set gitops_mode to false in your recipe or AutoPkg preferences."
-            )
-
+        """Run the GitOps workflow: upload package, update YAML, create PR."""
         # Validate inputs
         pkg_path = Path(self.env["pkg_path"]).expanduser().resolve()
         if not pkg_path.is_file():
@@ -923,9 +934,11 @@ class FleetImporter(Processor):
         version = self.env["version"].strip()
 
         # GitOps mode required parameters
-        aws_s3_bucket = self.env.get("aws_s3_bucket")
-        aws_cloudfront_domain = self.env.get("aws_cloudfront_domain")
-        gitops_repo_url = self.env.get("gitops_repo_url")
+        gitops_storage_provider = self._gitops_storage_provider()
+        aws_s3_bucket = self._gitops_value("aws_s3_bucket")
+        aws_cloudfront_domain = self._gitops_value("aws_cloudfront_domain")
+        gcp_storage_bucket = self._gitops_value("gcp_storage_bucket")
+        gitops_repo_url = self._gitops_value("gitops_repo_url")
         gitops_software_dir = self._gitops_path(
             "gitops_software_dir", "platforms/macos/software"
         )
@@ -939,23 +952,30 @@ class FleetImporter(Processor):
         gitops_team_yaml_path = self._gitops_path(
             "gitops_team_yaml_path", "fleets/workstations.yml"
         )
-        github_token = self.env.get("github_token")
+        github_token = self._gitops_value("github_token")
         s3_retention_versions = int(self.env.get("s3_retention_versions", 0))
 
         # Validate required GitOps parameters. gitops_team_yaml_path is omitted
         # here because it always resolves to a value (recipe Input or the
         # default applied by _gitops_path).
-        if not all(
-            [
-                aws_s3_bucket,
-                aws_cloudfront_domain,
-                gitops_repo_url,
-                github_token,
-            ]
-        ):
+        if not all([gitops_repo_url, github_token]):
             raise ProcessorError(
-                "GitOps mode requires: aws_s3_bucket, aws_cloudfront_domain, "
-                "gitops_repo_url, and github_token"
+                "GitOps mode requires: gitops_repo_url and github_token"
+            )
+
+        if gitops_storage_provider == "s3":
+            self._ensure_s3_dependencies()
+            if not all([aws_s3_bucket, aws_cloudfront_domain]):
+                raise ProcessorError(
+                    "GitOps S3 mode requires: aws_s3_bucket and aws_cloudfront_domain"
+                )
+        elif gitops_storage_provider == "gcs":
+            if not gcp_storage_bucket:
+                raise ProcessorError("GitOps GCS mode requires: gcp_storage_bucket")
+        else:
+            raise ProcessorError(
+                "gitops_storage_provider must be one of: s3, gcs "
+                f"(got {gitops_storage_provider})"
             )
 
         # Fleet deployment options
@@ -1081,47 +1101,22 @@ class FleetImporter(Processor):
                         "Could not extract icon from package. Skipping icon in GitOps."
                     )
 
-            # Upload package to S3
-            self.output(f"Uploading package to S3 bucket: {aws_s3_bucket}")
-            s3_key, package_was_uploaded = self._upload_to_s3(
-                aws_s3_bucket, software_title, version, pkg_path
-            )
-            self.output(f"Package in S3: {s3_key}")
-
-            # Calculate SHA-256 hash
-            # If package was uploaded, hash the local file
-            # If package already existed in S3, download and hash it to ensure accuracy
-            if package_was_uploaded:
-                self.output(
-                    f"Calculating SHA-256 hash from local file: {pkg_path.name}"
-                )
-                hash_sha256 = self._calculate_file_sha256(pkg_path)
-            else:
-                self.output(
-                    "Package already exists in S3. Downloading to calculate accurate SHA-256 hash..."
-                )
-                hash_sha256 = self._calculate_s3_file_sha256(aws_s3_bucket, s3_key)
-
-            self.output(f"SHA-256: {hash_sha256}")
-
-            # Construct CloudFront URL
-            cloudfront_url = self._construct_cloudfront_url(
-                aws_cloudfront_domain, s3_key
-            )
-            self.output(f"CloudFront URL: {cloudfront_url}")
-            self.env["cloudfront_url"] = cloudfront_url
-            self.env["hash_sha256"] = hash_sha256
-
-            # Clean up old versions in S3
-            if s3_retention_versions > 0:
-                self.output(
-                    f"Cleaning up old S3 versions (retaining {s3_retention_versions} most recent)..."
-                )
-                self._cleanup_old_s3_versions(
-                    aws_s3_bucket, software_title, version, s3_retention_versions
+            if gitops_storage_provider == "s3":
+                package_url, hash_sha256 = self._prepare_s3_gitops_package(
+                    aws_s3_bucket,
+                    aws_cloudfront_domain,
+                    software_title,
+                    version,
+                    pkg_path,
+                    s3_retention_versions,
                 )
             else:
-                self.output("S3 pruning disabled (s3_retention_versions = 0)")
+                package_url, hash_sha256 = self._prepare_gcs_gitops_package(
+                    gcp_storage_bucket,
+                    software_title,
+                    version,
+                    pkg_path,
+                )
 
             # Create software package YAML file
             self.output(f"Creating software package YAML in {gitops_software_dir}")
@@ -1130,7 +1125,7 @@ class FleetImporter(Processor):
                 gitops_software_dir,
                 gitops_scripts_dir,
                 software_title,
-                cloudfront_url,
+                package_url,
                 hash_sha256,
                 install_script,
                 uninstall_script,
@@ -1211,10 +1206,10 @@ class FleetImporter(Processor):
             self.env["pull_request_url"] = pr_url
 
         except Exception as e:
-            # If we have a CloudFront URL, log it so it can be manually added
-            if "cloudfront_url" in self.env:
+            # If we have a package URL, log it so it can be manually added.
+            if "package_url" in self.env:
                 self.output(
-                    f"ERROR: GitOps workflow failed, but package was uploaded to: {self.env['cloudfront_url']}"
+                    f"ERROR: GitOps workflow failed, but package was uploaded to: {self.env['package_url']}"
                 )
             raise ProcessorError(f"GitOps workflow failed: {e}")
         finally:
@@ -1345,6 +1340,25 @@ class FleetImporter(Processor):
         if not value or self._UNSUBSTITUTED_VAR.match(value):
             return default
         return value
+
+    def _gitops_value(self, key: str, default: str = "") -> str:
+        """Resolve a scalar GitOps input, ignoring unsubstituted AutoPkg macros."""
+        value = (self.env.get(key) or "").strip()
+        if not value or self._UNSUBSTITUTED_VAR.match(value):
+            return default
+        return value
+
+    def _gitops_storage_provider(self) -> str:
+        """Return the configured GitOps package storage provider."""
+        provider = self._gitops_value(
+            "gitops_storage_provider", DEFAULT_GITOPS_STORAGE_PROVIDER
+        ).lower()
+        if provider not in {"s3", "gcs"}:
+            raise ProcessorError(
+                "gitops_storage_provider must be one of: s3, gcs "
+                f"(got {provider})"
+            )
+        return provider
 
     def _extract_icon_from_pkg(self, pkg_path: Path) -> Path | None:
         """Extract and convert app icon from a package to PNG format.
@@ -1859,6 +1873,221 @@ class FleetImporter(Processor):
                 shutil.rmtree(temp_dir, ignore_errors=True)
             return None
 
+    def _ensure_s3_dependencies(self):
+        """Import boto3 lazily when the GitOps S3 backend is used."""
+        global boto3, ClientError, NoCredentialsError
+        if (
+            boto3 is not None
+            and ClientError is not None
+            and NoCredentialsError is not None
+        ):
+            return
+        try:
+            import boto3
+            from botocore.exceptions import ClientError, NoCredentialsError
+        except ImportError:
+            raise ProcessorError(
+                "boto3 is required for GitOps S3 mode.\n\n"
+                "Install it into AutoPkg's Python environment with:\n"
+                "  /Library/AutoPkg/Python3/Python.framework/Versions/Current/bin/python3 -m pip install boto3>=1.18.0\n\n"
+                "Or use direct mode to upload directly to Fleet API without S3/GitOps:\n"
+                "  Set gitops_mode to false in your recipe or AutoPkg preferences."
+            )
+
+    def _package_storage_key(
+        self, software_title: str, version: str, pkg_path: Path
+    ) -> str:
+        """Build the object key used by GitOps package storage backends."""
+        extension = pkg_path.suffix
+        return f"software/{software_title}/{software_title}-{version}{extension}"
+
+    def _prepare_s3_gitops_package(
+        self,
+        aws_s3_bucket: str,
+        aws_cloudfront_domain: str,
+        software_title: str,
+        version: str,
+        pkg_path: Path,
+        s3_retention_versions: int,
+    ) -> tuple[str, str]:
+        """Upload package to S3 and return (package_url, hash_sha256)."""
+        self.output(f"Uploading package to S3 bucket: {aws_s3_bucket}")
+        s3_key, package_was_uploaded = self._upload_to_s3(
+            aws_s3_bucket, software_title, version, pkg_path
+        )
+        self.output(f"Package in S3: {s3_key}")
+
+        if package_was_uploaded:
+            self.output(f"Calculating SHA-256 hash from local file: {pkg_path.name}")
+            hash_sha256 = self._calculate_file_sha256(pkg_path)
+        else:
+            self.output(
+                "Package already exists in S3. Downloading to calculate "
+                "accurate SHA-256 hash..."
+            )
+            hash_sha256 = self._calculate_s3_file_sha256(aws_s3_bucket, s3_key)
+
+        self.output(f"SHA-256: {hash_sha256}")
+
+        cloudfront_url = self._construct_cloudfront_url(aws_cloudfront_domain, s3_key)
+        self.output(f"CloudFront URL: {cloudfront_url}")
+        self.env["cloudfront_url"] = cloudfront_url
+        self.env["package_url"] = cloudfront_url
+        self.env["hash_sha256"] = hash_sha256
+
+        if s3_retention_versions > 0:
+            self.output(
+                f"Cleaning up old S3 versions (retaining {s3_retention_versions} most recent)..."
+            )
+            self._cleanup_old_s3_versions(
+                aws_s3_bucket, software_title, version, s3_retention_versions
+            )
+        else:
+            self.output("S3 pruning disabled (s3_retention_versions = 0)")
+
+        return cloudfront_url, hash_sha256
+
+    def _prepare_gcs_gitops_package(
+        self,
+        gcp_storage_bucket: str,
+        software_title: str,
+        version: str,
+        pkg_path: Path,
+    ) -> tuple[str, str]:
+        """Upload package to GCS and return (signed_url, hash_sha256)."""
+        self.output(f"Uploading package to GCS bucket: {gcp_storage_bucket}")
+        gcs_key, package_was_uploaded = self._upload_to_gcs(
+            gcp_storage_bucket, software_title, version, pkg_path
+        )
+        self.output(f"Package in GCS: {gcs_key}")
+
+        if package_was_uploaded:
+            self.output(f"Calculating SHA-256 hash from local file: {pkg_path.name}")
+            hash_sha256 = self._calculate_file_sha256(pkg_path)
+        else:
+            self.output(
+                "Package already exists in GCS. Downloading to calculate "
+                "accurate SHA-256 hash..."
+            )
+            hash_sha256 = self._calculate_gcs_file_sha256(gcp_storage_bucket, gcs_key)
+
+        self.output(f"SHA-256: {hash_sha256}")
+
+        signed_url = self._generate_gcs_signed_url(gcp_storage_bucket, gcs_key)
+        self.output("Generated GCS signed URL for package")
+        self.env["gcs_signed_url"] = signed_url
+        self.env["package_url"] = signed_url
+        self.env["hash_sha256"] = hash_sha256
+        return signed_url, hash_sha256
+
+    def _get_gcs_client(self):
+        """Get configured Google Cloud Storage client."""
+        try:
+            from google.cloud import storage
+        except ImportError:
+            raise ProcessorError(
+                "google-cloud-storage is required for GitOps GCS mode.\n\n"
+                "Install it into AutoPkg's Python environment with:\n"
+                "  /Library/AutoPkg/Python3/Python.framework/Versions/Current/bin/python3 -m pip install google-cloud-storage"
+            )
+
+        credentials_json = self._gitops_value("gcp_credentials_json")
+        try:
+            if credentials_json:
+                if credentials_json.lstrip().startswith("{"):
+                    from google.oauth2 import service_account
+
+                    credentials_info = json.loads(credentials_json)
+                    credentials = (
+                        service_account.Credentials.from_service_account_info(
+                            credentials_info
+                        )
+                    )
+                    return storage.Client(
+                        credentials=credentials,
+                        project=credentials.project_id,
+                    )
+
+                credentials_path = Path(credentials_json).expanduser()
+                return storage.Client.from_service_account_json(str(credentials_path))
+            return storage.Client()
+        except json.JSONDecodeError as e:
+            raise ProcessorError(f"Failed to parse GCP service account JSON: {e}")
+        except Exception as e:
+            raise ProcessorError(f"Failed to create GCS client: {e}")
+
+    def _get_gcs_signed_url_expiration(self) -> int:
+        """Return validated GCS signed URL expiration in seconds."""
+        value = self._gitops_value(
+            "gcp_signed_url_expiration", str(GCS_SIGNED_URL_MAX_EXPIRATION)
+        )
+        try:
+            expiration = int(value)
+        except (TypeError, ValueError):
+            raise ProcessorError(
+                "gcp_signed_url_expiration must be an integer number of seconds, "
+                f"got {value}"
+            )
+        if expiration <= 0:
+            raise ProcessorError("gcp_signed_url_expiration must be greater than 0")
+        if expiration > GCS_SIGNED_URL_MAX_EXPIRATION:
+            raise ProcessorError(
+                "gcp_signed_url_expiration cannot exceed 604800 seconds "
+                "(7 days) for GCS V4 signed URLs"
+            )
+        return expiration
+
+    def _upload_to_gcs(
+        self, bucket: str, software_title: str, version: str, pkg_path: Path
+    ) -> tuple[str, bool]:
+        """Upload package to GCS and return (object key, was_uploaded)."""
+        try:
+            client = self._get_gcs_client()
+            bucket_obj = client.bucket(bucket)
+            gcs_key = self._package_storage_key(software_title, version, pkg_path)
+            blob = bucket_obj.blob(gcs_key)
+            local_size = pkg_path.stat().st_size
+
+            if blob.exists():
+                blob.reload()
+                if blob.size == local_size:
+                    self.output(
+                        f"Package {software_title} {version} already exists in "
+                        f"GCS at {gcs_key}. "
+                        f"Skipping upload (size: {blob.size} bytes)."
+                    )
+                    return gcs_key, False
+                self.output(
+                    f"Warning: GCS package size ({blob.size} bytes) differs "
+                    f"from local file ({local_size} bytes). "
+                    "Re-uploading package."
+                )
+            else:
+                self.output("Package not found in GCS, proceeding with upload")
+
+            self.output(f"Uploading to gs://{bucket}/{gcs_key}")
+            blob.upload_from_filename(
+                str(pkg_path), content_type="application/octet-stream"
+            )
+            self.output(f"Upload complete: gs://{bucket}/{gcs_key}")
+            return gcs_key, True
+        except Exception as e:
+            raise ProcessorError(f"GCS upload failed: {e}")
+
+    def _generate_gcs_signed_url(self, bucket: str, gcs_key: str) -> str:
+        """Generate a V4 signed GET URL for a GCS object."""
+        try:
+            client = self._get_gcs_client()
+            blob = client.bucket(bucket).blob(gcs_key)
+            expiration = self._get_gcs_signed_url_expiration()
+            return blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(seconds=expiration),
+                method="GET",
+            )
+        except Exception as e:
+            raise ProcessorError(f"Failed to generate GCS signed URL: {e}")
+
     def _get_aws_credentials(self) -> tuple[str, str, str]:
         """Get AWS credentials from processor environment.
 
@@ -1894,6 +2123,7 @@ class FleetImporter(Processor):
         Raises:
             ProcessorError: If boto3 is not available or credentials are missing
         """
+        self._ensure_s3_dependencies()
         if boto3 is None:
             raise ProcessorError(
                 "boto3 is required for S3 operations but could not be imported or installed. "
@@ -1937,8 +2167,7 @@ class FleetImporter(Processor):
             s3_client = self._get_s3_client()
 
             # Use AutoPkg standard naming: software/Title/Title-Version.pkg
-            extension = pkg_path.suffix
-            s3_key = f"software/{software_title}/{software_title}-{version}{extension}"
+            s3_key = self._package_storage_key(software_title, version, pkg_path)
 
             # Check if package already exists in S3
             try:
@@ -2293,7 +2522,7 @@ class FleetImporter(Processor):
         software_dir: str,
         scripts_dir: str,
         software_title: str,
-        cloudfront_url: str,
+        package_url: str,
         hash_sha256: str,
         install_script: str,
         uninstall_script: str,
@@ -2309,7 +2538,7 @@ class FleetImporter(Processor):
             software_dir: Directory for software YAMLs (e.g. platforms/macos/software)
             scripts_dir: Directory for script/query files (e.g. platforms/macos/scripts)
             software_title: Software title
-            cloudfront_url: CloudFront URL for package
+            package_url: URL for package download
             hash_sha256: SHA-256 hash of package
             install_script: Custom install script
             uninstall_script: Custom uninstall script
@@ -2337,7 +2566,7 @@ class FleetImporter(Processor):
 
         # Build package entry (Fleet expects a list with single item)
         package_entry = {
-            "url": cloudfront_url,
+            "url": package_url,
             "hash_sha256": hash_sha256,
         }
 
@@ -2883,6 +3112,21 @@ This PR was automatically generated by the FleetImporter AutoPkg processor.
             )
         except Exception as e:
             raise ProcessorError(f"Failed to calculate S3 file hash: {e}")
+
+    def _calculate_gcs_file_sha256(self, bucket: str, gcs_key: str) -> str:
+        """Calculate SHA-256 hash of a file in GCS by downloading it."""
+        try:
+            client = self._get_gcs_client()
+            blob = client.bucket(bucket).blob(gcs_key)
+
+            sha256_hash = hashlib.sha256()
+            with blob.open("rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    sha256_hash.update(chunk)
+
+            return sha256_hash.hexdigest()
+        except Exception as e:
+            raise ProcessorError(f"Failed to calculate GCS file hash: {e}")
 
     def _is_fleet_minimum_supported(self, fleet_version: str) -> bool:
         """Check if Fleet version meets minimum requirements."""

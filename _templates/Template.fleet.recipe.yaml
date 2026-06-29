@@ -34,6 +34,7 @@ Input:
   FLEET_GITOPS_ICONS_DIR: platforms/all/icons
   FLEET_GITOPS_POLICIES_DIR: platforms/macos/policies
   FLEET_GITOPS_TEAM_YAML_PATH: fleets/workstations.yml
+  GITOPS_STORAGE_PROVIDER: s3
   s3_retention_versions: 0
 
 Process:
@@ -60,6 +61,7 @@ Process:
     gitops_icons_dir: "%FLEET_GITOPS_ICONS_DIR%"
     gitops_policies_dir: "%FLEET_GITOPS_POLICIES_DIR%"
     gitops_team_yaml_path: "%FLEET_GITOPS_TEAM_YAML_PATH%"
+    gitops_storage_provider: "%GITOPS_STORAGE_PROVIDER%"
 
     # Direct mode arguments (read from AutoPkg preferences/env vars)
     fleet_api_base: "%FLEET_API_BASE%"
@@ -72,6 +74,9 @@ Process:
     aws_access_key_id: "%AWS_ACCESS_KEY_ID%"
     aws_secret_access_key: "%AWS_SECRET_ACCESS_KEY%"
     aws_default_region: "%AWS_DEFAULT_REGION%"
+    gcp_storage_bucket: "%GCP_STORAGE_BUCKET%"
+    gcp_credentials_json: "%GCP_CREDENTIALS_JSON%"
+    gcp_signed_url_expiration: "%GCP_SIGNED_URL_EXPIRATION%"
     gitops_repo_url: "%FLEET_GITOPS_REPO_URL%"
     github_token: "%FLEET_GITOPS_GITHUB_TOKEN%"
   Processor: com.github.fleet.FleetImporter/FleetImporter

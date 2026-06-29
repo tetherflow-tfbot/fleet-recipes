@@ -17,7 +17,7 @@ Fleet recipes depend on parent recipes from other AutoPkg repositories. See [PAR
 FleetImporter extends AutoPkg to integrate with Fleet's software management. Recipes use a **combined format** that supports both deployment modes in a single file:
 
 - **[Direct mode](#direct-mode)**: Upload packages directly to Fleet via API
-- **[GitOps mode](#gitops-mode)**: Upload to S3 and create pull requests for Git-based configuration management
+- **[GitOps mode](#gitops-mode)**: Upload to S3/CloudFront or Google Cloud Storage signed URLs and create pull requests for Git-based configuration management
 
 Mode is controlled by the `GITOPS_MODE` input variable (default: `false`). Users can switch modes via recipe overrides without maintaining separate recipe files.
 
@@ -29,6 +29,11 @@ Mode is controlled by the `GITOPS_MODE` input variable (default: `false`). Users
   - Must be installed manually into AutoPkg's Python environment:
     ```bash
     /Library/AutoPkg/Python3/Python.framework/Versions/Current/bin/python3 -m pip install boto3>=1.18.0
+    ```
+- **google-cloud-storage**: Required for GitOps mode GCS signed URL operations (optional for direct mode and S3 GitOps mode)
+  - Must be installed manually into AutoPkg's Python environment:
+    ```bash
+    /Library/AutoPkg/Python3/Python.framework/Versions/Current/bin/python3 -m pip install google-cloud-storage
     ```
   - Direct mode uses only native Python libraries (no external dependencies)
 
@@ -51,12 +56,18 @@ FleetImporter recipes support the following variables. Configuration can be set 
 | `FLEET_API_BASE` | Required | Not used | - | Fleet server URL (e.g., `https://fleet.example.com`) |
 | `FLEET_API_TOKEN` | Required | Not used | - | Fleet API authentication token |
 | `FLEET_TEAM_ID` | Required | Not used | - | Fleet team ID for software assignment |
+| **GitOps Storage** | | | | |
+| `GITOPS_STORAGE_PROVIDER` | Not used | Optional | `s3` | Package storage provider for GitOps mode (`s3` or `gcs`) |
 | **AWS S3 (GitOps Mode)** | | | | |
-| `AWS_S3_BUCKET` | Not used | Required | - | S3 bucket name for package storage |
-| `AWS_CLOUDFRONT_DOMAIN` | Not used | Required | - | CloudFront domain for package URLs |
+| `AWS_S3_BUCKET` | Not used | Required for S3 | - | S3 bucket name for package storage |
+| `AWS_CLOUDFRONT_DOMAIN` | Not used | Required for S3 | - | CloudFront domain for package URLs |
 | `AWS_ACCESS_KEY_ID` | Not used | Optional | - | AWS access key (can use `~/.aws/credentials` instead) |
 | `AWS_SECRET_ACCESS_KEY` | Not used | Optional | - | AWS secret key (can use `~/.aws/credentials` instead) |
-| `AWS_DEFAULT_REGION` | Not used | Required | `us-east-1` | AWS region for S3 operations |
+| `AWS_DEFAULT_REGION` | Not used | Required for S3 | `us-east-1` | AWS region for S3 operations |
+| **Google Cloud Storage (GitOps Mode)** | | | | |
+| `GCP_STORAGE_BUCKET` | Not used | Required for GCS | - | GCS bucket name for package storage |
+| `GCP_CREDENTIALS_JSON` | Not used | Optional | - | Google service account JSON key content or path. If omitted, Application Default Credentials are used |
+| `GCP_SIGNED_URL_EXPIRATION` | Not used | Optional | `604800` | GCS V4 signed URL expiration in seconds. Maximum: 604800 (7 days) |
 | **GitOps Repository** | | | | |
 | `FLEET_GITOPS_REPO_URL` | Not used | Required | - | Git repository URL for Fleet configuration |
 | `FLEET_GITOPS_GITHUB_TOKEN` | Not used | Required | - | GitHub token with permissions to push commits and open pull requests (see GitHub token permissions below) |
@@ -105,16 +116,20 @@ autopkg run VendorName/SoftwareName.fleet.recipe.yaml
 
 ## GitOps mode
 
-Upload packages to S3 and create GitOps pull requests for Fleet configuration management.
+Upload packages to S3/CloudFront or Google Cloud Storage and create GitOps pull requests for Fleet configuration management.
 
-> **Note:** GitOps mode requires you to provide your own S3 bucket and CloudFront distribution. When Fleet operates in GitOps mode, it deletes any packages not defined in the YAML files during sync ([fleetdm/fleet#34137](https://github.com/fleetdm/fleet/issues/34137)). By hosting packages externally and using pull requests, you can stage updates and merge them at your own pace.
+> **Note:** GitOps mode requires you to provide your own package hosting backend. S3 mode uses S3 plus CloudFront. GCS mode writes a V4 signed URL into the package YAML, and those URLs can be valid for at most 7 days. When Fleet operates in GitOps mode, it deletes any packages not defined in the YAML files during sync ([fleetdm/fleet#34137](https://github.com/fleetdm/fleet/issues/34137)). By hosting packages externally and using pull requests, you can stage updates and merge them at your own pace.
 
 ### Switching to GitOps mode
 
 **Prerequisites:**
-1. Install boto3 into AutoPkg's Python environment (required for S3 operations):
+1. Install the package storage dependency into AutoPkg's Python environment:
    ```bash
+   # S3/CloudFront backend
    /Library/AutoPkg/Python3/Python.framework/Versions/Current/bin/python3 -m pip install boto3>=1.18.0
+
+   # GCS signed URL backend
+   /Library/AutoPkg/Python3/Python.framework/Versions/Current/bin/python3 -m pip install google-cloud-storage
    ```
 
 2. Create a recipe override and set `GITOPS_MODE: true`:
@@ -129,15 +144,15 @@ Upload packages to S3 and create GitOps pull requests for Fleet configuration ma
 
 ### Required infrastructure
 
-- AWS S3 bucket for package storage
-- CloudFront distribution pointing to the S3 bucket
-- AWS credentials with read/write access to the S3 bucket
+- S3 backend: AWS S3 bucket, CloudFront distribution, and AWS credentials with read/write access to the S3 bucket
+- GCS backend: GCS bucket and Google credentials that can upload objects, read objects, and sign URLs
 
 ### Required configuration
 
-Set via AutoPkg preferences:
+Set S3/CloudFront configuration via AutoPkg preferences:
 
 ```bash
+defaults write com.github.autopkg GITOPS_STORAGE_PROVIDER "s3"
 defaults write com.github.autopkg AWS_S3_BUCKET "my-fleet-packages"
 defaults write com.github.autopkg AWS_CLOUDFRONT_DOMAIN "cdn.example.com"
 defaults write com.github.autopkg AWS_ACCESS_KEY_ID "your-access-key"
@@ -146,6 +161,19 @@ defaults write com.github.autopkg AWS_DEFAULT_REGION "us-east-1"
 defaults write com.github.autopkg FLEET_GITOPS_REPO_URL "https://github.com/org/fleet-gitops.git"
 defaults write com.github.autopkg FLEET_GITOPS_GITHUB_TOKEN "your-github-token"
 ```
+
+Set GCS signed URL configuration via AutoPkg preferences:
+
+```bash
+defaults write com.github.autopkg GITOPS_STORAGE_PROVIDER "gcs"
+defaults write com.github.autopkg GCP_STORAGE_BUCKET "my-fleet-packages"
+defaults write com.github.autopkg GCP_CREDENTIALS_JSON "/path/to/service-account.json"
+defaults write com.github.autopkg GCP_SIGNED_URL_EXPIRATION "604800"
+defaults write com.github.autopkg FLEET_GITOPS_REPO_URL "https://github.com/org/fleet-gitops.git"
+defaults write com.github.autopkg FLEET_GITOPS_GITHUB_TOKEN "your-github-token"
+```
+
+`GCP_CREDENTIALS_JSON` can be either the JSON key content itself or a path to a JSON key file. For local AutoPkg runs, a path is usually easier to manage. For CI, storing the JSON content directly in the variable may be simpler.
 
 ### GitHub token permissions
 
@@ -162,8 +190,8 @@ defaults write com.github.autopkg FLEET_GITOPS_GITHUB_TOKEN "your-github-token"
 
 ### GitOps workflow
 
-1. Package is uploaded to S3
-2. CloudFront URL is generated
+1. Package is uploaded to the configured storage backend
+2. Package URL is generated (CloudFront URL for S3, signed URL for GCS)
 3. Software YAML is created in the GitOps repo, along with any companion files it references (scripts/queries in `FLEET_GITOPS_SCRIPTS_DIR`, icon in `FLEET_GITOPS_ICONS_DIR`, auto-update policy in `FLEET_GITOPS_POLICIES_DIR`)
 4. Pull request is opened for review
 

@@ -102,7 +102,9 @@ All recipes must include these arguments in the `Input` section:
   - `AUTO_UPDATE_ENABLED`: Set to `false` by default (users can override to enable)
   - `AUTO_UPDATE_POLICY_NAME`: Set to `autopkg-auto-update-%NAME%` template
 
-**Note:** Mode-specific credentials (API tokens, AWS keys, etc.) come from AutoPkg preferences or environment variables, NOT from the recipe Input section.
+**Note:** Mode-specific credentials (API tokens, AWS keys, GCP service account JSON, etc.) come from AutoPkg preferences or environment variables, NOT from the recipe Input section.
+
+GitOps package storage defaults to S3/CloudFront. New recipes may include optional processor arguments for `gitops_storage_provider`, `gcp_storage_bucket`, `gcp_credentials_json`, and `gcp_signed_url_expiration` when they need to expose Google Cloud Storage signed URL support explicitly.
 
 ### Auto-Update Policies
 
